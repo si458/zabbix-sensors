@@ -5,9 +5,9 @@ import json
 import re
 import os
 import sys
+import glob
 
 DIR = "/sys/class/hwmon"
-
 
 def read(fn):
     try:
@@ -22,7 +22,6 @@ def read(fn):
         else:
             raise
 
-
 def read_parse(fn):
     x = read(fn).strip()
     try:
@@ -30,37 +29,85 @@ def read_parse(fn):
     except ValueError:
         return x
 
-
 def list_hwmon():
     return sorted([f for f in os.listdir(DIR) if f.startswith("hwmon")])
 
+def get_hwmon_name(path):
+    name_path = f"{path}/name"
+    if os.path.exists(name_path):
+        return read(name_path).strip()
+    device_name_path = f"{path}/device/name"
+    if os.path.exists(device_name_path):
+        return read(device_name_path).strip()
+    return None
 
 def process_sensors(path):
     r = {}
-    for fn in os.listdir(path):
-        m = re.match(r"^(fan|in|temp|power)(\d+)_(.*)$", fn)
-        if not m:
+    
+    # Check both root and device paths (device first)
+    search_paths = [path]
+    device_path = f"{path}/device"
+    if os.path.exists(device_path):
+        search_paths.insert(0, device_path)
+    
+    for base_path in search_paths:
+        try:
+            for fn in os.listdir(base_path):
+                # Match sensor files (temp1_input, fan2_min etc)
+                m = re.match(r"^(fan|in|temp|power)(\d+)_(.*)$", fn)
+                if not m:
+                    continue
+
+                sensor_type, sensor_num, reading_type = m.groups()
+                sensor_id = f"{sensor_type}{sensor_num}"
+                
+                # Initialize sensor entry if not exists
+                if sensor_id not in r:
+                    r[sensor_id] = {"sensor_type": sensor_type}
+                    
+                    # Check for label file
+                    label_file = f"{base_path}/{sensor_type}{sensor_num}_label"
+                    if os.path.exists(label_file):
+                        r[sensor_id]["label"] = read(label_file).strip()
+                
+                # Add the reading if not already present
+                if reading_type not in r[sensor_id]:
+                    r[sensor_id][reading_type] = read_parse(f"{base_path}/{fn}")
+                    
+        except OSError:
             continue
-
-        t, i, rd = m.group(1, 2, 3)
-
-        sens = f"{t}{i}"
-        if sens not in r:
-            r[sens] = {"sensor_type": t}
-
-        r[sens][rd] = read_parse(f"{path}/{fn}")
-
+            
     return r
-
 
 def process_hwmon(n):
     path = f"{DIR}/{n}"
-    if not os.path.exists(f"{path}/name"):
+    name = get_hwmon_name(path)
+    if not name:
         return None, None
 
-    name = read(f"{path}/name").strip()
-    return name, process_sensors(path)
+    # Handle block device naming (original functionality)
+    blockdev = False
+    device_path = f"{path}/device"
+    
+    if os.path.isdir(f"{device_path}/block"):
+        blockdev = os.path.basename(glob.glob(f"{device_path}/block/*")[0])
+    elif os.path.isdir(f"{path}/block"):
+        blockdev = os.path.basename(glob.glob(f"{path}/block/*")[0])
 
+    if not blockdev:
+        nvme_paths = glob.glob(f"{device_path}/nvme*") or glob.glob(f"{path}/nvme*")
+        if nvme_paths:
+            blockdev = os.path.basename(nvme_paths[0])
+
+    raw_devlinks = glob.glob("/dev/disk/by-id/*")
+    devlinks = list(filter(lambda x: not re.search("^nvme-eui|^nvme-nvme|^wwn-0x|^scsi-[0-9]", os.path.basename(x)), raw_devlinks))
+    if blockdev:
+        for devlink in devlinks:
+            if os.path.islink(devlink) and blockdev == os.path.basename(os.readlink(devlink)):
+                name = os.path.basename(devlink)
+                break
+
+    return name, process_sensors(path)
 
 def main():
     r = {}
@@ -74,11 +121,9 @@ def main():
         if not sensors:
             continue
 
-        name = f"{hwm}-{name}"
         r[name] = sensors
 
     print(json.dumps(r, indent=2, sort_keys=True))
-
 
 if __name__ == "__main__":
     main()
